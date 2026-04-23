@@ -317,6 +317,17 @@ def run_lm_eval(model_cfg: dict, benchmark_cfg: dict, api_url: str) -> None:
         _patch_ruler_tokenizer_for_openai()
         model_type = "local-chat-completions"
         completions_url = api_url.rstrip("/") + "/chat/completions"
+    elif provider == "groq":
+        # Groq serves OpenAI-compatible chat completions for hosted Llama
+        # models. RULER needs an HF tokenizer to size prompts; we hand the
+        # canonical HF model id (or YAML override) to the shim subprocess
+        # via env var so it can `AutoTokenizer.from_pretrained(...)`.
+        hf_tokenizer = (
+            model_cfg["model"].get("tokenizer_name") or model_name
+        )
+        os.environ["RULER_HF_TOKENIZER"] = hf_tokenizer
+        model_type = "local-chat-completions"
+        completions_url = api_url.rstrip("/") + "/chat/completions"
     else:
         model_type = "local-completions"
         completions_url = api_url.rstrip("/") + "/completions"
@@ -331,12 +342,21 @@ def run_lm_eval(model_cfg: dict, benchmark_cfg: dict, api_url: str) -> None:
         f",timeout=3600"
     )
 
-    if provider != "openai":
+    if provider not in ("openai", "groq"):
         model_args += f",tokenizer={model_name}"
 
     api_key = model_cfg.get("server", {}).get("api_key", "")
+    # Allow API keys to be supplied via the standard provider env vars when
+    # the YAML doesn't carry one (recommended: never commit keys to YAML).
+    if (not api_key or api_key == "dummy") and provider == "groq":
+        api_key = os.environ.get("GROQ_API_KEY", "")
+    if (not api_key or api_key == "dummy") and provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+
     if api_key and api_key != "dummy":
         model_args += f",api_key={api_key}"
+        # lm_eval's local-chat-completions reads OPENAI_API_KEY regardless of
+        # the upstream provider, since the wire format is OpenAI-compatible.
         os.environ["OPENAI_API_KEY"] = api_key
 
     tasks = evaluation.get("tasks", "ruler")
@@ -367,7 +387,7 @@ def run_lm_eval(model_cfg: dict, benchmark_cfg: dict, api_url: str) -> None:
         "--log_samples",
     ]
 
-    if provider == "openai":
+    if provider in ("openai", "groq"):
         cli_args += ["--apply_chat_template"]
 
     if "ruler" in tasks:

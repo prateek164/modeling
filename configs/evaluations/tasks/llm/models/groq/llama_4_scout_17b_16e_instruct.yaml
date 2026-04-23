@@ -1,0 +1,17 @@
+model:
+  name: "meta-llama/llama-4-scout-17b-16e-instruct"
+  # HF repo id used by run.py to load the tokenizer for RULER prompt sizing.
+  # Groq's served model id is lowercase; the canonical HF id is mixed case.
+  # The model is gated on HF — accept the license and export HF_TOKEN before
+  # running RULER, or set RULER_TOKENIZER_PATH to a local download.
+  tokenizer_name: "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+  temperature: 0.0
+  hosted: true
+
+server:
+  base_url: "https://api.groq.com/openai/v1"
+  # Leave api_key unset here — export GROQ_API_KEY in the shell instead.
+
+metadata:
+  family: "llama"
+  provider: "groq"

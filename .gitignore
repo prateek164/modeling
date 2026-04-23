@@ -2,6 +2,9 @@
 .env
 *.env
 !.env.example
+context.md
+models.md
+rnd.md
 
 # Python
 __pycache__/

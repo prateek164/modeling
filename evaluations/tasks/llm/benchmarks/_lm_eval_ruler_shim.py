@@ -1,7 +1,12 @@
 """
 Shim that patches RULER for:
   1. OpenAI tiktoken tokenizer (when --apply_chat_template is present)
-  2. Caching synthetic dataset generation across model runs
+  2. Groq / Llama HF AutoTokenizer (when RULER_HF_TOKENIZER or
+     RULER_TOKENIZER_PATH is set, in addition to --apply_chat_template).
+     This runs AFTER the OpenAI block and overrides it when active, so
+     hosted Llama-style models served via OpenAI-compatible APIs (Groq) get
+     the correct tokenizer for RULER prompt-length accounting.
+  3. Caching synthetic dataset generation across model runs
 
 Called by run.py for all RULER evaluations.
 """
@@ -141,6 +146,42 @@ if "--apply_chat_template" in sys.argv:
         qa_utils.get_tokenizer = _tok_replacement
     except (ImportError, AttributeError):
         pass
+
+# ---------------------------------------------------------------------------
+# Groq / hosted Llama HF tokenizer patch.
+#
+# Activated when EITHER of these env vars is set (run.py sets RULER_HF_TOKENIZER
+# automatically when provider == "groq"):
+#   RULER_TOKENIZER_PATH  — local directory containing HF tokenizer files
+#                           (tokenizer.json, tokenizer_config.json,
+#                            special_tokens_map.json, chat_template.jinja)
+#   RULER_HF_TOKENIZER    — HF model id, e.g. meta-llama/Llama-4-Scout-17B-16E-Instruct
+#                           (gated; requires HF_TOKEN env var to be exported)
+#
+# Runs after the OpenAI block so it cleanly overrides the tiktoken wrapper
+# when both are technically applicable. Also requires --apply_chat_template
+# (RULER's get_tokenizer is only called in that path).
+# ---------------------------------------------------------------------------
+if "--apply_chat_template" in sys.argv:
+    _hf_tok_source = (
+        os.environ.get("RULER_TOKENIZER_PATH")
+        or os.environ.get("RULER_HF_TOKENIZER")
+    )
+    if _hf_tok_source:
+        from transformers import AutoTokenizer
+
+        print(f"  [ruler-tokenizer] Loading HF tokenizer from {_hf_tok_source}")
+        _hf_tok = AutoTokenizer.from_pretrained(_hf_tok_source)
+        _hf_replacement = lambda *args, **kwargs: _hf_tok  # noqa: E731
+
+        from lm_eval.tasks.ruler import common_utils as _cu
+        _cu.get_tokenizer = _hf_replacement
+
+        try:
+            from lm_eval.tasks.ruler import qa_utils as _qu
+            _qu.get_tokenizer = _hf_replacement
+        except (ImportError, AttributeError):
+            pass
 
 # ---------------------------------------------------------------------------
 # Hand off to lm_eval CLI
