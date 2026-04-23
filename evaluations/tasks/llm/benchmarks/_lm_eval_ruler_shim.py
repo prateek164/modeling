@@ -244,17 +244,35 @@ if "--apply_chat_template" in sys.argv:
 
             def _estimate_request_tokens(messages) -> int:
                 """Cheap upper-bound: count chars in serialized payload / 3.5
-                (≈ tiktoken bpe ratio) plus a fixed completion buffer."""
+                (≈ tiktoken bpe ratio) plus a fixed completion buffer.
+
+                lm_eval passes `messages` as either a tuple/list of
+                JsonChatStr (chat completions, our Groq case), a list of
+                strings (text completions), a list of token-id lists
+                (tokenized requests), or a single JsonChatStr/str.
+                """
                 total_chars = 0
-                if isinstance(messages, list) and messages:
+                if isinstance(messages, (list, tuple)) and messages:
                     first = messages[0]
                     if isinstance(first, JsonChatStr):
-                        total_chars = len(first.prompt)
+                        total_chars = sum(
+                            len(m.prompt) for m in messages
+                            if isinstance(m, JsonChatStr)
+                        )
                     elif isinstance(first, str):
-                        total_chars = sum(len(m) for m in messages if isinstance(m, str))
-                    elif isinstance(first, list) and first and isinstance(first[0], int):
-                        return sum(len(m) for m in messages)  # token ids
-                return int(total_chars / 3.5) + 256
+                        total_chars = sum(
+                            len(m) for m in messages if isinstance(m, str)
+                        )
+                    elif isinstance(first, (list, tuple)) and first and isinstance(first[0], int):
+                        return sum(len(m) for m in messages) + 256  # token ids
+                elif isinstance(messages, JsonChatStr):
+                    total_chars = len(messages.prompt)
+                elif isinstance(messages, str):
+                    total_chars = len(messages)
+                est = int(total_chars / 3.5) + 256
+                # Hard floor of 1000 tokens — defends against any unexpected
+                # input shape silently degrading throttling to a no-op.
+                return max(est, 1000)
 
             def _wait_for_tpm_budget(needed: int) -> None:
                 while True:
@@ -274,17 +292,58 @@ if "--apply_chat_template" in sys.argv:
                     _time.sleep(sleep_for)
 
             _orig_model_call = TemplateAPI.model_call
+            _first_call_seen = [False]
 
-            def _throttled_model_call(self, messages, **kwargs):
+            def _throttled_model_call(self, *args, **kwargs):
+                # lm_eval invokes this as `model_call(messages=req, ...)`.
+                # Support both positional and keyword forms defensively.
+                messages = kwargs.get("messages")
+                if messages is None and args:
+                    messages = args[0]
                 est = _estimate_request_tokens(messages)
+                if not _first_call_seen[0]:
+                    _first_call_seen[0] = True
+                    print(
+                        f"  [ruler-throttle] First request: estimated {est} tokens"
+                        f" (input type={type(messages).__name__},"
+                        f" inner={type(messages[0]).__name__ if isinstance(messages, (list, tuple)) and messages else 'n/a'})"
+                    )
                 _wait_for_tpm_budget(est)
-                return _orig_model_call(self, messages, **kwargs)
+                return _orig_model_call(self, *args, **kwargs)
 
             TemplateAPI.model_call = _throttled_model_call
             print(
                 f"  [ruler-throttle] Client-side TPM throttle active:"
                 f" budget={_TPM_BUDGET}/{_TPM_LIMIT} tokens/min"
                 f" (safety={_TPM_SAFETY})"
+            )
+
+            # ---------------------------------------------------------------
+            # Safety guardrail: override lm_eval's retry wait policy.
+            #
+            # lm_eval defaults to:
+            #   wait_exponential(multiplier=0.5, min=1, max=10)
+            # i.e. retry after 0.5s, 1s, 2s, 4s, 8s, capped at 10s. This
+            # respects Groq's "Please try again in Xs" hint when X<10s,
+            # but if our token estimator ever undershoots and a 429 still
+            # leaks through, a 10s wait may not be enough to clear the
+            # 60-second TPM window — we'd just retry and fail again.
+            #
+            # Replace it with a fixed 60s wait (configurable via
+            # RULER_RETRY_WAIT_SEC) so any 429 forces a full window
+            # rollover before retrying. With the proactive throttle
+            # above, this code path should rarely fire — it's pure
+            # belt-and-suspenders.
+            # ---------------------------------------------------------------
+            import tenacity as _tenacity
+            from lm_eval.models import api_models as _api_models_mod
+            _RETRY_WAIT_SEC = int(os.environ.get("RULER_RETRY_WAIT_SEC", "60"))
+            _api_models_mod.wait_exponential = (
+                lambda **kw: _tenacity.wait_fixed(_RETRY_WAIT_SEC)
+            )
+            print(
+                f"  [ruler-throttle] Retry wait overridden:"
+                f" fixed {_RETRY_WAIT_SEC}s on 429 (was exp backoff capped at 10s)"
             )
 
 # ---------------------------------------------------------------------------
