@@ -326,6 +326,13 @@ def run_lm_eval(model_cfg: dict, benchmark_cfg: dict, api_url: str) -> None:
             model_cfg["model"].get("tokenizer_name") or model_name
         )
         os.environ["RULER_HF_TOKENIZER"] = hf_tokenizer
+
+        # Proactive client-side TPM throttle to avoid 429 retry storms.
+        # Default to Groq's free-tier limit on Llama-4 Scout; can be
+        # overridden via the model YAML's `server.tpm_limit` field.
+        tpm_limit = model_cfg.get("server", {}).get("tpm_limit", 300_000)
+        os.environ["RULER_TPM_LIMIT"] = str(tpm_limit)
+
         model_type = "local-chat-completions"
         completions_url = api_url.rstrip("/") + "/chat/completions"
     else:
@@ -344,6 +351,13 @@ def run_lm_eval(model_cfg: dict, benchmark_cfg: dict, api_url: str) -> None:
 
     if provider not in ("openai", "groq"):
         model_args += f",tokenizer={model_name}"
+
+    if provider == "groq":
+        # Llama 4 Scout end-of-turn token. Setting eos_string silences
+        # lm_eval's "Cannot determine EOS string" warning and ensures it
+        # ends up in the request `stop` array as a belt-and-suspenders
+        # measure (Groq strips <|eot|> server-side anyway).
+        model_args += ",eos_string=<|eot|>"
 
     api_key = model_cfg.get("server", {}).get("api_key", "")
     # Allow API keys to be supplied via the standard provider env vars when

@@ -212,6 +212,81 @@ if "--apply_chat_template" in sys.argv:
         TemplateAPI.apply_chat_template = _apply_chat_template_groq
         print("  [ruler-tokenizer] Patched TemplateAPI.apply_chat_template to drop spurious 'type' field (Groq compat)")
 
+        # ---------------------------------------------------------------
+        # Proactive TPM (tokens-per-minute) throttle.
+        #
+        # lm_eval's only rate-limit defense is `max_retries=5` with
+        # exponential backoff, but each retry still costs an API round
+        # trip and the request never *progresses* until the bucket has
+        # room. At long contexts (32K-131K) we can exhaust max_retries
+        # before the bucket refills, killing the run.
+        #
+        # Solution: maintain a sliding 60-second token-usage window
+        # client-side and sleep BEFORE issuing each request if it would
+        # breach the budget. This eliminates 429s entirely.
+        #
+        # Activated when RULER_TPM_LIMIT is set (run.py exports it for
+        # the Groq path). Tunable via:
+        #   RULER_TPM_LIMIT       — provider's TPM ceiling (e.g. 300000)
+        #   RULER_TPM_SAFETY      — fraction of ceiling to actually use
+        #                            (default 0.85; leaves 15% headroom
+        #                             for token-count estimation error)
+        # ---------------------------------------------------------------
+        _tpm_limit_str = os.environ.get("RULER_TPM_LIMIT")
+        if _tpm_limit_str:
+            import time as _time
+            from collections import deque
+
+            _TPM_LIMIT = int(_tpm_limit_str)
+            _TPM_SAFETY = float(os.environ.get("RULER_TPM_SAFETY", "0.85"))
+            _TPM_BUDGET = int(_TPM_LIMIT * _TPM_SAFETY)
+            _tpm_window: "deque[tuple[float, int]]" = deque()
+
+            def _estimate_request_tokens(messages) -> int:
+                """Cheap upper-bound: count chars in serialized payload / 3.5
+                (≈ tiktoken bpe ratio) plus a fixed completion buffer."""
+                total_chars = 0
+                if isinstance(messages, list) and messages:
+                    first = messages[0]
+                    if isinstance(first, JsonChatStr):
+                        total_chars = len(first.prompt)
+                    elif isinstance(first, str):
+                        total_chars = sum(len(m) for m in messages if isinstance(m, str))
+                    elif isinstance(first, list) and first and isinstance(first[0], int):
+                        return sum(len(m) for m in messages)  # token ids
+                return int(total_chars / 3.5) + 256
+
+            def _wait_for_tpm_budget(needed: int) -> None:
+                while True:
+                    now = _time.monotonic()
+                    while _tpm_window and _tpm_window[0][0] < now - 60.0:
+                        _tpm_window.popleft()
+                    used = sum(t for _, t in _tpm_window)
+                    if used + needed <= _TPM_BUDGET:
+                        _tpm_window.append((now, needed))
+                        return
+                    oldest_ts = _tpm_window[0][0]
+                    sleep_for = max(0.2, 60.0 - (now - oldest_ts) + 0.2)
+                    print(
+                        f"  [ruler-throttle] TPM budget {used}/{_TPM_BUDGET}"
+                        f" + {needed} requested; sleeping {sleep_for:.1f}s"
+                    )
+                    _time.sleep(sleep_for)
+
+            _orig_model_call = TemplateAPI.model_call
+
+            def _throttled_model_call(self, messages, **kwargs):
+                est = _estimate_request_tokens(messages)
+                _wait_for_tpm_budget(est)
+                return _orig_model_call(self, messages, **kwargs)
+
+            TemplateAPI.model_call = _throttled_model_call
+            print(
+                f"  [ruler-throttle] Client-side TPM throttle active:"
+                f" budget={_TPM_BUDGET}/{_TPM_LIMIT} tokens/min"
+                f" (safety={_TPM_SAFETY})"
+            )
+
 # ---------------------------------------------------------------------------
 # Hand off to lm_eval CLI
 # ---------------------------------------------------------------------------
