@@ -183,6 +183,35 @@ if "--apply_chat_template" in sys.argv:
         except (ImportError, AttributeError):
             pass
 
+        # ---------------------------------------------------------------
+        # Groq strict-validates chat-completions payloads and rejects the
+        # spurious top-level `"type": "text"` field that lm_eval injects
+        # into every message dict (see TemplateAPI.apply_chat_template in
+        # lm_eval/models/api_models.py). OpenAI silently ignores it; Groq
+        # returns:  "property 'type' is unsupported".
+        #
+        # We re-bind apply_chat_template on the TemplateAPI base class so
+        # that the message list is serialized verbatim — canonical OpenAI
+        # format ({"role": ..., "content": ...} only). Scoped to the HF
+        # tokenizer branch, so the OpenAI tiktoken path above is untouched.
+        # ---------------------------------------------------------------
+        from lm_eval.models.api_models import TemplateAPI, JsonChatStr
+
+        def _apply_chat_template_groq(self, chat_history, add_generation_prompt=True):
+            if self.tokenizer_backend == "huggingface" and self.tokenized_requests:
+                return self.tokenizer.apply_chat_template(
+                    chat_history,
+                    tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                    continue_final_message=not add_generation_prompt,
+                )
+            if self.tokenizer_backend == "remote" and self.tokenized_requests:
+                return chat_history
+            return JsonChatStr(json.dumps(chat_history, ensure_ascii=False))
+
+        TemplateAPI.apply_chat_template = _apply_chat_template_groq
+        print("  [ruler-tokenizer] Patched TemplateAPI.apply_chat_template to drop spurious 'type' field (Groq compat)")
+
 # ---------------------------------------------------------------------------
 # Hand off to lm_eval CLI
 # ---------------------------------------------------------------------------
